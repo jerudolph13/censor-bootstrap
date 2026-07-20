@@ -1,15 +1,35 @@
 
+###########################################################################
+#
+# Project: Bootstrapping censored data
+#
+# Purpose: Apply different bootstrap approaches to survival data
+#
+# Author: Jacqueline Rudolph
+#
+# Last Update: 20 Jul 2026
+#
+###########################################################################
+
 library(tidyverse)
 library(boot)
 library(survival)
+
+
+# Read in data ------------------------------------------------------------
 
 dat <- read_csv("./wihs_public_lau2009.csv") %>% 
   mutate(delta = as.numeric(eventtype==2)) %>% 
   select(t, delta, BASEIDU) 
 
-dat <- bind_rows(dat, data.frame(t=10.81451+2, delta=0, BASEIDU=1))
+# The below doesn't seem to be necessary for conditional; maybe package handles that
+#dat <- bind_rows(dat, data.frame(t=10.81451+2, delta=0, BASEIDU=1))
 
-# Estimate risk at 10 years for AIDS or death (censor at treatment)
+
+# Run analyses ------------------------------------------------------------
+
+# GOAL: Estimate risk at 10 years for AIDS or death (censor at treatment) by baseline
+#       injection drug use and estimate standard errors
 
 # Greenwood's variance
 surv <- survfit(Surv(t, delta) ~ BASEIDU, data=dat)
@@ -90,4 +110,4 @@ surv.fun3 <- function(data, str) {
 }
 weird <- censboot(cbind(dat$t, dat$delta), surv.fun3, R=1000,
                   strata=dat$BASEIDU, F.surv=event.surv, sim="weird")
-
+  weird
