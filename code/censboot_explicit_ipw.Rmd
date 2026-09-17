@@ -1,0 +1,360 @@
+---
+title: "Bootstrapping Censored Data: Explicit Implementations"
+subtitle: "Running weighted survival"
+author: "censor-bootstrap project (Jacqueline Rudolph, Ashley Naimi)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(survival)
+library(here)
+i_am("code/censboot_explicit.Rmd")
+set.seed(123)
+```
+
+# Purpose
+
+`code/censboot_lau.R` estimates the **10-year risk of AIDS or death** (censoring at
+treatment) by baseline injection-drug use (`idu`) in the Lau (2009) WIHS data, and
+gets standard errors four ways: a classic bootstrap, a case-based bootstrap, a
+conditional bootstrap, and a "weird" bootstrap — all through `boot::boot` and
+`boot::censboot`. 
+
+Those functions are black boxes. Here we reproduce the same analysis
+with more explicit user-defined functions to make the resampling steps visible. 
+
+A validation appendix runs the original package code verbatim to confirm agreement.
+
+The `classic` and `case` blocks of the original are the *same* algorithm (ordinary nonparametric
+resampling) run through two different wrappers, so the three distinct schemes are
+**ordinary**, **conditional**, and **weird**.
+
+```{r data}
+raw <- read.csv(here("data", "wihs_public_lau2009.csv"))
+dat <- data.frame(
+  t       = raw$t,
+  delta   = as.numeric(raw$eventtype == 2),   # 1 = AIDS/death; 0 = censored or competing event
+  idu = raw$BASEIDU,
+  age = raw$ageatfda,
+  black = raw$black,
+  cd4nadir = raw$cd4nadir
+)
+tau <- 10                                       # risk horizon, in years
+R   <- 1000                                     # bootstrap replicates
+
+head(dat)
+
+```
+
+# The estimand and the analytic reference
+
+Every method targets the same statistic: for each `idu` stratum, the risk
+$\theta_g = 1 - \hat S_g(\tau)$ at $\tau = 10$ years, where $\hat S_g$ is the Kaplan–Meier
+survival curve in stratum $g$.
+
+Isolate that in one function used everywhere:
+
+```{r estimand}
+# Risk at tau for each stratum (g = 0, 1), returned in order c(IDU=0, IDU=1)
+risk_at_t <- function(data, tau = 10) {
+  vapply(c(0, 1), function(g) {
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, , drop = FALSE],
+                  se.fit = F)
+    1 - summary(sf, times = tau, extend = TRUE)$surv
+  }, numeric(1))
+}
+
+# Risk at tau for each stratum, now weighting to control for confounding
+risk_at_t_wt <- function(data, tau = 10) {
+  
+  ps <- glm(idu ~ age + black + cd4nadir, data=data, family=binomial(link="logit"))$fitted.values
+  data$wt <- 1 / (data$idu*ps + (1 - data$idu)*(1 - ps))
+  
+  vapply(c(0, 1), function(g) {
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, , drop = FALSE], 
+                  weights = wt, se.fit = F)
+    1 - summary(sf, times = tau, extend = TRUE)$surv
+  }, numeric(1))
+}
+
+```
+
+We will compare the bootstrap results to the analytic standard error (Greenwood standard error).
+
+In the case of weighting, we will also compare against the jackknife robust standard error
+including in the survfit function.
+
+```{r analytic}
+
+# Estimate weights
+ps <- glm(idu ~ age + black + cd4nadir, data=dat, family=binomial(link="logit"))$fitted.values
+dat$wt <- 1 / (dat$idu*ps + (1 - dat$idu)*(1 - ps))
+  summary(dat$wt)
+  
+# Greenwood: point risk and analytic SE (SE of 1 - S equals SE of S)
+greenwood_ref <- function(data, tau = 10) {
+  
+  out <- sapply(c(0, 1), function(g) {
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, , drop = FALSE], 
+                  weights=wt, robust=F)
+    s  <- summary(sf, times = tau, extend = TRUE)
+    c(risk = 1 - s$surv, se = s$std.err)
+  })
+  colnames(out) <- c("IDU=0", "IDU=1")
+  out
+}
+
+gw <- greenwood_ref(dat, tau)
+gw
+
+# Jackknife
+jackknife_ref <- function(data, tau = 10) {
+  out <- sapply(c(0, 1), function(g) {
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, , drop = FALSE], 
+                  weights=wt, robust=T)
+    s  <- summary(sf, times = tau, extend = TRUE)
+    c(risk = 1 - s$surv, se = s$std.err)
+  })
+  colnames(out) <- c("IDU=0", "IDU=1")
+  out
+}
+
+jk <- jackknife_ref(dat, tau)
+jk
+
+```
+
+Two small helpers used by the resampling schemes below: a safe categorical sampler
+(avoids R's `sample()` "single value" trap, that selects a range from 1:value if 
+only a single value is supplied), and a routine that reads the jump masses
+off a Kaplan–Meier curve — i.e. that turns an estimated survival function into the
+discrete distribution you simulate from.
+
+```{r helpers}
+# Draw n values from the support `times` with probabilities `prob`
+rcat <- function(times, prob, n = 1) {
+  times[sample.int(length(times), n, replace = TRUE, prob = prob)]
+}
+
+# Discrete distribution implied by a KM curve: P(T = t_j) = S(t_{j-1}) - S(t_j)
+km_atoms <- function(time, status) {
+  sf   <- survfit(Surv(time, status) ~ 1)
+  jump <- c(1, head(sf$surv, -1)) - sf$surv     # 0 at times with no "event" of this type
+  data.frame(time = sf$time, prob = jump)
+}
+```
+
+# Ordinary (case) bootstrap — "Efron's method"
+
+This is the classic nonparametric resampling bootstrap. Treat the $n$ observed 
+pairs $(t_i, \delta_i)$ as the population and draw
+a new sample of size $n$ *with replacement*, then recompute the risk. 
+
+Efron (1981) showed this is equivalent to independently simulating a fresh event time from $\hat F$ and a fresh censoring time from $\hat G$ for each record and keeping the smaller — so both the event
+times and the censoring pattern vary from replicate to replicate. 
+
+It assumes nothing beyond independent, identically distributed subjects. 
+
+This is what both the original `classic` (`boot`) and `case` (`censboot(sim = "ordinary")`) blocks do.
+
+Pseudocode: 
+
+```
+for r in 1..R:
+    draw indices i_1..i_n uniformly with replacement from 1..n
+    D* <- data[i_1..i_n, ]
+    theta*_r[g] <- 1 - KM_g(tau) fit on D*      for each stratum g
+SE[g] <- sd_r( theta*_r[g] )
+```
+
+```{r ordinary}
+boot_ordinary <- function(data, R = 1000, tau = 10) {
+  n <- nrow(data)
+  replicate(R, {
+    idx <- sample.int(n, n, replace = TRUE)     # resample whole records
+    risk_at_t_wt(data[idx, , drop = FALSE], tau)
+  })
+}
+
+set.seed(123)
+ord_reps <- boot_ordinary(dat, R, tau)
+ord_se   <- apply(ord_reps, 1, sd)
+ord_se
+```
+
+# Conditional bootstrap
+
+**How it works.** The conditional bootstrap holds the *censoring pattern* closer to what
+was observed. For each subject it draws a brand-new event time from the Kaplan–Meier
+event distribution $\hat F$ (within that subject's stratum), but treats censoring
+conditionally: subjects observed to be censored keep their exact censoring time, while
+subjects observed to fail are assigned a hypothetical censoring time drawn from the
+censoring distribution $\hat G$ restricted to times *after* their observed follow-up. The
+new observation is the minimum of the two. Because $\hat F$ may not reach 1 when the
+largest time is censored, a probability atom beyond the last observed time absorbs the
+residual mass (equivalent to Davison & Hinkley's "add a record past the maximum" device;
+`censboot` does this internally — cf. the commented `bind_rows` line in the original).
+
+```
+Precompute  F_g <- KM of event times within stratum g       (status = delta)
+            G   <- KM of censoring times, pooled             (status = 1 - delta)
+for r in 1..R:
+    for subject i in stratum g:
+        Y0*_i <- draw from F_g                               # new latent event time
+        if delta_i == 0:  C*_i <- t_i                        # keep observed censoring
+        else:             C*_i <- draw from G on (t_i, inf)  # hypothetical censoring
+        t*_i     <- min(Y0*_i, C*_i)
+        delta*_i <- 1{ Y0*_i <= C*_i }
+    theta*_r[g] <- 1 - KM_g(tau) fit on (t*, delta*)
+SE[g] <- sd_r( theta*_r[g] )
+```
+
+```{r conditional}
+boot_conditional <- function(data, R = 1000, tau = 10) {
+  n <- nrow(data)
+  # F-hat: event-time distribution within each stratum
+  Fhat <- lapply(c(0, 1), function(g) {
+    d <- data[data$idu == g, ]
+    km_atoms(d$t, d$delta)
+  })
+  names(Fhat) <- c("0", "1")
+  # G-hat: censoring-time distribution, pooled across strata
+  Ghat      <- km_atoms(data$t, 1 - data$delta)
+  Ghat      <- Ghat[Ghat$prob > 0, ]            # keep only the censoring atoms
+  tail_time <- max(data$t) + 1                  # absorbs residual mass of F-hat
+
+  one_rep <- function() {
+    # Step 1: new event times from the stratum-specific F-hat
+    y0 <- numeric(n)
+    for (g in c(0, 1)) {
+      idx <- which(data$idu == g)
+      A   <- Fhat[[as.character(g)]]
+      y0[idx] <- rcat(c(A$time, tail_time), c(A$prob, 1 - sum(A$prob)), length(idx))
+    }
+    # Step 2: censoring times, conditional on the observed pattern
+    cstar <- data$t                             # delta == 0: keep observed censoring time
+    for (i in which(data$delta == 1)) {         # delta == 1: draw C > observed t_i
+      elig     <- Ghat[Ghat$time > data$t[i], ]
+      cstar[i] <- if (nrow(elig) == 0) Inf else rcat(elig$time, elig$prob, 1)
+    }
+    # Step 3: combine and evaluate the estimand
+    risk_at_t_wt(data.frame(t = pmin(y0, cstar),
+                            delta = as.numeric(y0 <= cstar),
+                            idu = data$idu,
+                            age = data$age,
+                            black = data$black,
+                            cd4nadir = data$cd4nadir), tau)
+  }
+  replicate(R, one_rep())
+}
+
+set.seed(123)
+cond_reps <- boot_conditional(dat, R, tau)
+cond_se   <- apply(cond_reps, 1, sd)
+cond_se
+```
+
+# Weird bootstrap
+
+**How it works.** The weird bootstrap (Andersen, Borgan, Gill & Keiding 1993) works on the
+counting-process representation and holds *everything* fixed except the number of events.
+At each observed failure time $u_j$ the risk set $n_j$ and the observed number of events
+$d_j$ are known; it redraws the events there as an independent
+$\text{Binomial}(n_j, d_j/n_j)$ and rebuilds the survival curve as the product-limit
+$\hat S^*(\tau) = \prod_{u_j \le \tau}(1 - d_j^*/n_j)$. Nothing about who is at risk or when
+censoring happens changes — only the event counts fluctuate — so it reproduces the
+Nelson–Aalen / Greenwood variance by construction. It is "weird" because a replicate
+corresponds to no actual set of individuals.
+
+```
+Precompute per stratum g:  failure times u_1<...<u_m (<= tau),
+                           risk sets n_j, event counts d_j
+for r in 1..R:
+    for each stratum g, each failure time u_j:
+        d*_j <- Binomial(n_j, d_j / n_j)        # risk set n_j held fixed
+    theta*_r[g] <- 1 - prod_j (1 - d*_j / n_j)
+SE[g] <- sd_r( theta*_r[g] )
+```
+
+```{r weird}
+boot_weird <- function(data, R = 1000, tau = 10) {
+  # Per stratum, capture the fixed risk sets and event counts up to tau
+  strata <- lapply(c(0, 1), function(g) {
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, ])
+    keep <- sf$n.event > 0 & sf$time <= tau
+    list(n = sf$n.risk[keep], d = sf$n.event[keep])
+  })
+  replicate(R, vapply(strata, function(s) {
+    dstar <- rbinom(length(s$d), size = s$n, prob = s$d / s$n)   # resample events only
+    1 - prod(1 - dstar / s$n)                                    # 1 - S*(tau)
+  }, numeric(1)))
+}
+
+set.seed(123)
+weird_reps <- boot_weird(dat, R, tau)
+weird_se   <- apply(weird_reps, 1, sd)
+weird_se
+
+# Now with weights
+boot_weird_wt <- function(data, R = 1000, tau = 10) {
+  # Per stratum, capture the fixed risk sets and event counts up to tau
+  strata <- lapply(c(0, 1), function(g) {
+    # It seems to me that you need to apply the weights here because there are not individuals
+    #   after resampling. BUT then the n and d are no loner integers. How off will results be if we round(n)?
+    #   Results are still closer to the Greenwood (wrong) SE than the other methods
+    ps <- glm(idu ~ age + black + cd4nadir, data=data, family=binomial(link="logit"))$fitted.values
+    data$wt <- 1 / (data$idu*ps + (1 - data$idu)*(1 - ps))
+    
+    sf <- survfit(Surv(t, delta) ~ 1, data = data[data$idu == g, ], weights=wt, se.fit=F)
+    keep <- sf$n.event > 0 & sf$time <= tau
+    list(n = round(sf$n.risk[keep]), d = sf$n.event[keep])
+  })
+  replicate(R, vapply(strata, function(s) {
+    dstar <- rbinom(length(s$d), size = s$n, prob = s$d / s$n)   # resample events only
+    1 - prod(1 - dstar / s$n)                                    # 1 - S*(tau)
+  }, numeric(1)))
+}
+
+set.seed(123)
+weird_reps <- boot_weird_wt(dat, R, tau)
+weird_se   <- apply(weird_reps, 1, sd)
+weird_se
+
+
+```
+
+# Results: all four standard errors side by side
+
+```{r results}
+comparison <- data.frame(
+  Stratum          = c("IDU = 0", "IDU = 1"),
+  `Risk at 10y`    = round(gw["risk", ], 3),
+  `SE: Greenwood`  = round(gw["se", ],   3),
+  `SE: Jackknife`  = round(jk["se", ],   3),
+  `SE: Ordinary`   = round(ord_se,       3),
+  `SE: Conditional`= round(cond_se,      3),
+  `SE: Weird`      = round(weird_se,     3),
+  check.names = FALSE, row.names = NULL
+)
+knitr::kable(comparison, caption = "10-year risk of AIDS/death and its standard error.")
+```
+
+The weird bootstrap should sit essentially on top of Greenwood; the ordinary and
+conditional schemes approximate it up to Monte-Carlo error. Where the conditional and
+ordinary SEs *diverge* from Greenwood is the substantive question the paper is after —
+e.g. whether they carry variability (such as in estimated weights) that the analytic
+formula and the weird scheme do not.
+
+
+---
+
+*Conceptual background: the vault Main Note "Bootstrapping Censored Data". Full annotated
+bibliography: `_corpus/censor-bootstrap_references.md`.*

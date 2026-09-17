@@ -18,7 +18,7 @@ library(survival)
 
 # Read in data ------------------------------------------------------------
 
-dat <- read_csv("./wihs_public_lau2009.csv") %>% 
+dat <- read_csv("../data/wihs_public_lau2009.csv") %>% 
   mutate(delta = as.numeric(eventtype==2)) %>% 
   select(t, delta, BASEIDU) 
 
