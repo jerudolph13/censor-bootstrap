@@ -10,6 +10,11 @@ output:
     number_sections: true
     code_folding: show
     theme: readable
+knit: (function(inputFile, encoding) { 
+      out_dir <- 'doc';
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path("..", out_dir, 'censboot_explicit_ipw.html')) })
 ---
 
 ```{r setup, include=FALSE}
